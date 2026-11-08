@@ -34,6 +34,7 @@ import {
 } from '@/store/prompts'
 import { rememberServerRequest } from '@/store/server-requests'
 import { $selectedStoredSessionId, $sessions, lineageAliases, sessionMatchesStoredId } from '@/store/session'
+import { $focusedStoredSessionId } from '@/store/session-focus'
 import {
   $sessionStates,
   $sessionTiles,
@@ -101,6 +102,11 @@ export interface ServerRequestContext {
   sessionId: string
   /** The named session is the one on screen. */
   isActiveSession: boolean
+  /** The named session is the one the user is WORKING IN: the primary they are
+   *  typing into, or the focused tile. A workspace layout hosts every chat as a
+   *  tile, where `isActiveSession` (the primary's runtime id) names a session
+   *  that is not on screen — pane-backed handlers gate on this instead. */
+  isFocusedSession: boolean
 }
 
 type Handler = (ctx: ServerRequestContext) => void
@@ -173,6 +179,43 @@ export function requestNamesActiveSession({
     .some(
       session => sessionMatchesStoredId(session, requestStoredId) && sessionMatchesStoredId(session, activeStoredId)
     )
+}
+
+/**
+ * Whether a request's `session_id` names the conversation the user is WORKING
+ * IN: the primary chat being typed into, or the focused session tile.
+ * `$focusedStoredSessionId` already falls back to the primary selection when no
+ * tile holds focus, so a single-pane window keeps the old answer — but a
+ * workspace layout hosts every chat as a `session-tile:` pane, and there the
+ * primary's runtime id names a session that is not on screen. Pane-backed
+ * bridges (preview.act, the preview vault) gate on this instead, which is what
+ * "the session the user is looking at" means when the chat is a tile (#133421).
+ * Resolved through the same stored-id/lineage rails as the active check, so a
+ * compression-rotated runtime still matches its conversation.
+ */
+export function requestNamesFocusedSession({
+  sessionId,
+  storedIdForRuntimeId = () => undefined
+}: {
+  sessionId: string
+  storedIdForRuntimeId?: (runtimeId: string) => string | undefined
+}): boolean {
+  if (!sessionId) {
+    return false
+  }
+
+  const focusedStoredId = $focusedStoredSessionId.get()
+
+  if (!focusedStoredId) {
+    return false
+  }
+
+  const requestStoredId = storedIdForRuntimeId(sessionId) ?? sessionId
+
+  return (
+    requestStoredId === focusedStoredId ||
+    lineageAliases(focusedStoredId, $sessions.get()).includes(requestStoredId)
+  )
 }
 
 /** This window hosts the session: it is the primary view or an open session tile. */
@@ -546,12 +589,18 @@ const previewRead: Handler = ({ request, sessionId }) => {
   })()
 }
 
-const previewAct: Handler = ({ deps, isActiveSession, request, sessionId }) => {
-  // drive_preview tool: click/type/scroll/press inside the guest page. Active
-  // session only: a background turn (including one in a tile this window hosts)
-  // must never reach into the page the user is working in (desktop AGENTS.md:
-  // offer, don't hijack). Window ownership is settled by WINDOW_OWNED_REQUESTS
-  // before this runs, so a refusal here reaches the tool instead of stalling it.
+const previewAct: Handler = ({ deps, isActiveSession, isFocusedSession, request, sessionId }) => {
+  // drive_preview tool: click/type/scroll/press inside the guest page. The
+  // session the user is LOOKING AT only — the primary being typed into or the
+  // focused tile — because a background turn (including one in a tile this
+  // window hosts) must never reach into the page the user is working in
+  // (desktop AGENTS.md: offer, don't hijack). Gating on the primary runtime
+  // alone refused every chat in a tile workspace: there the primary's id names
+  // a session that is not on screen, the drawer in front is the focused tile's
+  // own tabs, and the tool was answered with "only takes actions in the session
+  // the user is looking at" for the chat the user WAS looking at. Window
+  // ownership is settled by WINDOW_OWNED_REQUESTS before this runs, so a
+  // refusal here reaches the tool instead of stalling it.
   const p = request.params
 
   if (str(p.action) === 'vault') {
@@ -565,11 +614,16 @@ const previewAct: Handler = ({ deps, isActiveSession, request, sessionId }) => {
       const storedIdForRuntimeId = (runtimeId: string) =>
         deps.sessionStateByRuntimeIdRef.current.get(runtimeId)?.storedSessionId ?? undefined
 
-      return requestNamesActiveSession({
-        activeSessionId: deps.activeSessionIdRef.current,
-        sessionId,
-        storedIdForRuntimeId
-      })
+      // The same foreground rule as the act path below: the chat the user is
+      // working in may be a session tile, so the focused leg counts here too
+      // (#133421). Re-evaluated live — a vault op can outlive a focus change.
+      return (
+        requestNamesActiveSession({
+          activeSessionId: deps.activeSessionIdRef.current,
+          sessionId,
+          storedIdForRuntimeId
+        }) || requestNamesFocusedSession({ sessionId, storedIdForRuntimeId })
+      )
     }
 
     const watch = sessionId
@@ -664,7 +718,7 @@ const previewAct: Handler = ({ deps, isActiveSession, request, sessionId }) => {
     return
   }
 
-  if (!isActiveSession) {
+  if (!isActiveSession && !isFocusedSession) {
     answerValue(request, {
       error: 'The in-app browser only takes actions in the session the user is looking at.',
       success: false
@@ -939,6 +993,13 @@ export function handleServerRequest(
   const storedIdForRuntimeId = (runtimeId: string) =>
     deps.sessionStateByRuntimeIdRef.current.get(runtimeId)?.storedSessionId ?? undefined
 
+  // The session the user is WORKING IN, which a pane-backed handler may act on:
+  // the focused tile's stored id (a workspace layout hosts every chat as a tile,
+  // where the primary's runtime id names a session that is not on screen), else
+  // the primary selection. Resolved through the same stored-id/lineage rails as
+  // the active check, so a compression-rotated runtime still matches.
+  const isFocusedSession = requestNamesFocusedSession({ sessionId, storedIdForRuntimeId })
+
   if (WINDOW_OWNED_REQUESTS.has(request.method)) {
     // Route window.read through the tolerant claim (see windowReadClaimsSession);
     // every other window-owned request keeps the strict host check.
@@ -978,7 +1039,7 @@ export function handleServerRequest(
             storedIdForRuntimeId
           }) === 'run'
         ) {
-          handler({ deps, request, sessionId, isActiveSession: true })
+          handler({ deps, request, sessionId, isActiveSession: true, isFocusedSession: true })
         } else {
           declineNotShown(request)
         }
@@ -992,7 +1053,8 @@ export function handleServerRequest(
     deps,
     request,
     sessionId,
-    isActiveSession: requestNamesActiveSession({ activeSessionId, sessionId, storedIdForRuntimeId })
+    isActiveSession: requestNamesActiveSession({ activeSessionId, sessionId, storedIdForRuntimeId }),
+    isFocusedSession
   })
 
   return true

@@ -39,6 +39,20 @@ vi.mock('@/app/chat/right-rail/preview-popout-bridge', () => ({
   requestPopoutPreviewVault: (payload: unknown, owner?: unknown) => requestPopoutPreviewVault(payload, owner)
 }))
 
+/** Poll instead of guessing a tick count: the handler answers after a dynamic
+ *  engine import, which lands on its own schedule. */
+const waitFor = async (predicate: () => boolean, timeoutMs = 2000) => {
+  const started = Date.now()
+
+  while (!predicate()) {
+    if (Date.now() - started > timeoutMs) {
+      throw new Error('condition not met before timeout')
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+}
+
 const deps = {
   activeSessionIdRef: { current: null },
   sessionInterrupted: () => false,
@@ -222,6 +236,77 @@ describe('preview action request routing', () => {
     const { respond } = deliver('preview.act', { action: 'elements' }, null)
 
     expect(JSON.parse(respond.mock.calls[0][0].value)).toMatchObject({ success: false })
+  })
+
+  it('answers a preview action for the chat the user is working in, hosted as a focused tile', async () => {
+    // A workspace layout hosts every chat as a tile, so the primary's runtime id
+    // names a session that is NOT on screen while the drawer in front shows the
+    // focused tile's own tabs. Gating on isActiveSession alone answered "only
+    // takes actions in the session the user is looking at" for exactly the
+    // session the user was looking at — drive_preview was unusable there.
+    const focused = (stored: string) => {
+      $sessionTiles.set([{ runtimeId: `runtime-${stored}`, storedSessionId: stored } as never])
+      setSelectedStoredSessionId('stored-primary')
+      $layoutTree.set(
+        group(['workspace', `session-tile:${stored}`], { active: `session-tile:${stored}`, id: 'main' })
+      )
+      noteActiveTreeGroup('main')
+      deps.sessionStateByRuntimeIdRef.current.set(`runtime-${stored}`, { storedSessionId: stored } as never)
+    }
+
+    const reset = () => {
+      $layoutTree.set(null)
+      noteActiveTreeGroup(null)
+      $sessionTiles.set([])
+      setSelectedStoredSessionId(null)
+      deps.sessionStateByRuntimeIdRef.current.clear()
+    }
+
+    focused('stored-tile')
+
+    try {
+      const { decline, respond } = deliver('preview.act', { action: 'elements', session_id: 'runtime-stored-tile' }, 'runtime-primary')
+
+      await waitFor(() => respond.mock.calls.length > 0)
+
+      expect(decline).not.toHaveBeenCalled()
+
+      // The gate let the action through to the engine, which reports the missing
+      // page (no live tab in this suite) instead of the session refusal.
+      const payload = JSON.parse(respond.mock.calls[0][0].value)
+
+      expect(payload.success).toBe(false)
+      expect(payload.error).not.toContain('only takes actions')
+    } finally {
+      reset()
+    }
+  })
+
+  it('still refuses a tile that is not the focused chat', async () => {
+    // The hijack guard survives the widening: a turn running in a tile the user
+    // is NOT looking at must never reach into the pane in front.
+    $sessionTiles.set([{ runtimeId: 'runtime-bg', storedSessionId: 'stored-bg' } as never])
+    setSelectedStoredSessionId('stored-primary')
+    $layoutTree.set(group(['workspace', 'session-tile:stored-tile'], { active: 'session-tile:stored-tile', id: 'main' }))
+    noteActiveTreeGroup('main')
+    deps.sessionStateByRuntimeIdRef.current.set('runtime-bg', { storedSessionId: 'stored-bg' } as never)
+
+    try {
+      const { respond } = deliver('preview.act', { action: 'elements', session_id: 'runtime-bg' }, 'runtime-primary')
+
+      await new Promise(resolve => setTimeout(resolve, 0))
+
+      expect(JSON.parse(respond.mock.calls[0][0].value)).toMatchObject({
+        error: expect.stringContaining('only takes actions') as string,
+        success: false
+      })
+    } finally {
+      $layoutTree.set(null)
+      noteActiveTreeGroup(null)
+      $sessionTiles.set([])
+      setSelectedStoredSessionId(null)
+      deps.sessionStateByRuntimeIdRef.current.clear()
+    }
   })
 })
 
